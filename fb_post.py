@@ -19,6 +19,7 @@ fb_post.py - сваля текста и снимките от пост във Fa
 """
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -336,6 +337,14 @@ def scrape(ctx, url, out_dir=OUT_DIR):
     return folder, data["text"], saved
 
 
+def ask_user():
+    print("=== Сваляне на постове от Facebook ===\n")
+    users = input("Потребител (име, id или линк; няколко - със запетая): ").strip()
+    limit = input("Колко поста назад? [10]: ").strip()
+    users = [u for u in re.split(r"[,\s]+", users) if u]
+    return users, int(limit) if limit.isdigit() and int(limit) > 0 else 10
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
@@ -353,20 +362,30 @@ def main():
     if args.file:
         jobs += [(l.strip(), OUT_DIR) for l in Path(args.file).read_text(encoding="utf-8").splitlines() if l.strip()]
 
+    # Без аргументи (напр. от start.bat) - питаме кой потребител и колко поста.
+    interactive = not jobs and not args.user and not args.login
+    if interactive:
+        args.user, args.limit = ask_user()
+        args.headless = True
+        if not args.user:
+            return
+
     with sync_playwright() as p:
         if args.login:
             login(p)
             if not jobs and not args.user:
                 return
-        if not jobs and not args.user:
-            ap.print_help()
-            return
 
         browser = launch(p, headless=args.headless)
         ctx = new_context(browser)
         if not logged_in(ctx):
             browser.close()
-            sys.exit("Не си влязъл във Facebook. Пусни първо: python fb_post.py --login")
+            if not interactive:
+                sys.exit("Не си влязъл във Facebook. Пусни първо: python fb_post.py --login")
+            print("\nПърво трябва да влезеш във Facebook (само веднъж).")
+            login(p)
+            browser = launch(p, headless=args.headless)
+            ctx = new_context(browser)
 
         for user in args.user:
             print(f"\nТърся постове на {user} ...")
@@ -389,6 +408,11 @@ def main():
             print(f"  Снимки: {len(saved)}  →  {folder}")
         ctx.storage_state(path=str(SESSION_FILE))  # обновени бисквитки за следващия път
         browser.close()
+
+    if interactive:
+        print(f"\nГотово. Свалените постове са в {OUT_DIR}")
+        if OUT_DIR.exists():
+            os.startfile(OUT_DIR)
 
 
 if __name__ == "__main__":
