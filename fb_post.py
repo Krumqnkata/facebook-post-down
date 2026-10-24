@@ -36,20 +36,18 @@ OUT_DIR = HERE / "downloads"
 MAIN_IMAGE = 'img[data-visualcompletion="media-vc-image"]'
 
 # Facebook често сменя HTML-а си - ако текстът спре да се намира, тук се добавя нов селектор.
-EXTRACT_JS = r"""
-() => {
-  const sels = [
-    '[data-ad-rendering-role="story_message"]',
-    '[data-ad-comet-preview="message"]',
-    '[data-ad-preview="message"]',
-  ];
-  let msg = null;
-  for (const s of sels) { msg = document.querySelector(s); if (msg) break; }
+FIND_POST_JS = r"""
+  const MSG = '[data-ad-rendering-role="story_message"], [data-ad-comet-preview="message"], [data-ad-preview="message"]';
+  // Когато си влязъл, FB отваря поста в прозорец (role="dialog") върху началната страница,
+  // а отдолу остават постове от стената - затова прозорецът е с предимство.
+  const dialogs = [...document.querySelectorAll('[role="dialog"]')].filter(d => d.querySelector('[role="article"]'));
+  const root = dialogs.length ? dialogs[dialogs.length - 1]
+    : (document.querySelector('[role="main"]') || document.body);
+  const msg = root.querySelector(MSG);
+  const scope = (msg && msg.closest('[role="article"]')) || root.querySelector('[role="article"]') || root;
+"""
 
-  const scope = (msg && (msg.closest('[role="article"]') || msg.closest('[role="dialog"]')))
-    || document.querySelector('[role="dialog"]')
-    || document.querySelector('[role="main"]')
-    || document.body;
+EXTRACT_JS = "() => {" + FIND_POST_JS + r"""
 
   const isPhoto = h => /\/photo(\.php)?\/?\?|\/photos\/|[?&]fbid=/.test(h);
   // Снимки в коментарите не ни трябват: коментарите са вложени role="article".
@@ -83,9 +81,7 @@ EXTRACT_JS = r"""
 }
 """
 
-SEE_MORE_JS = r"""
-() => {
-  const msg = document.querySelector('[data-ad-rendering-role="story_message"], [data-ad-comet-preview="message"], [data-ad-preview="message"]');
+SEE_MORE_JS = "() => {" + FIND_POST_JS + r"""
   if (!msg) return false;
   for (const b of msg.querySelectorAll('[role="button"]')) {
     if (/^(see more|виж още|вижте още|още)$/i.test(b.innerText.trim())) { b.click(); return true; }
