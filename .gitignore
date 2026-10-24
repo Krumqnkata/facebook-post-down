@@ -1,0 +1,6 @@
+# бисквитките за вход във Facebook - никога не се качват
+fb_session.json
+
+downloads/
+__pycache__/
+*.pyc
