@@ -20,6 +20,7 @@ fb_post.py - сваля текста и снимките от пост във Fa
 import argparse
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -35,6 +36,13 @@ SESSION_FILE = HERE / "fb_session.json"  # бисквитките за вход 
 OUT_DIR = HERE / "downloads"
 
 MAIN_IMAGE = 'img[data-visualcompletion="media-vc-image"]'
+
+# Защити срещу блокиране: случайни паузи (секунди) като при човек и дневен лимит на постовете.
+PHOTO_PAUSE = (2, 5)    # между снимките в един пост
+POST_PAUSE = (10, 25)   # между постовете
+SCROLL_PAUSE = (2, 4)   # между скроловете по стената
+DAILY_LIMIT = 50        # постове на ден, броят се в usage.json
+USAGE_FILE = HERE / "usage.json"
 
 # Facebook често сменя HTML-а си - ако текстът спре да се намира, тук се добавя нов селектор.
 FIND_POST_JS = r"""
@@ -96,16 +104,48 @@ def launch(p, headless):
     # Ползваме вече инсталиран браузър (Edge/Chrome), за да не се тегли Chromium.
     for channel in ("msedge", "chrome", None):
         try:
-            return p.chromium.launch(channel=channel, headless=headless)
+            return p.chromium.launch(
+                channel=channel,
+                headless=headless,
+                # иначе navigator.webdriver = true и сайтът вижда, че браузърът е автоматизиран
+                args=["--disable-blink-features=AutomationControlled"],
+            )
         except PWError:
             continue
     sys.exit("Не намерих Edge или Chrome. Пусни: python -m playwright install chromium")
 
 
+def real_user_agent(browser):
+    # Без прозорец браузърът се представя като "HeadlessChrome" - това издава бот.
+    tmp = browser.new_context()
+    ua = tmp.new_page().evaluate("navigator.userAgent")
+    tmp.close()
+    return ua.replace("HeadlessChrome", "Chrome")
+
+
 def new_context(browser):
     return browser.new_context(
         viewport={"width": 1280, "height": 900},
+        user_agent=real_user_agent(browser),
         storage_state=str(SESSION_FILE) if SESSION_FILE.exists() else None,
+    )
+
+
+def pause(span):
+    time.sleep(random.uniform(*span))
+
+
+def used_today():
+    try:
+        d = json.loads(USAGE_FILE.read_text(encoding="utf-8"))
+        return d["posts"] if d.get("date") == time.strftime("%Y-%m-%d") else 0
+    except (OSError, ValueError, KeyError):
+        return 0
+
+
+def count_post():
+    USAGE_FILE.write_text(
+        json.dumps({"date": time.strftime("%Y-%m-%d"), "posts": used_today() + 1}), encoding="utf-8"
     )
 
 
@@ -167,7 +207,9 @@ def collect_images(page, links, extra):
     srcs = []
     if not extra:
         # Всички снимки се виждат в поста - отваряме всяка поотделно.
-        for href in links:
+        for i, href in enumerate(links):
+            if i:
+                pause(PHOTO_PAUSE)
             page.goto(href, wait_until="domcontentloaded")
             src = main_image_src(page, srcs[-1] if srcs else None)
             if src:
@@ -185,6 +227,9 @@ def collect_images(page, links, extra):
             break
         seen.add(key)
         srcs.append(src)
+        if len(srcs) >= expected:
+            break
+        pause(PHOTO_PAUSE)
         old = page.url
         page.keyboard.press("ArrowRight")
         try:
@@ -284,7 +329,7 @@ def find_user_posts(ctx, user, limit):
                 print(f"  намерен пост {len(urls)}: {href}")
         idle = idle + 1 if len(urls) == before else 0
         page.mouse.wheel(0, 2500)
-        time.sleep(1.5)
+        pause(SCROLL_PAUSE)
     page.close()
     return urls
 
@@ -337,8 +382,9 @@ def scrape(ctx, url, out_dir=OUT_DIR):
     return folder, data["text"], saved
 
 
-def ask_user():
+def ask_user(left):
     print("=== Сваляне на постове от Facebook ===\n")
+    print(f"Днес може още {left} поста (дневен лимит {DAILY_LIMIT}).\n")
     users = input("Потребител (име, id или линк; няколко - със запетая): ").strip()
     limit = input("Колко поста назад? [10]: ").strip()
     users = [u for u in re.split(r"[,\s]+", users) if u]
@@ -362,10 +408,15 @@ def main():
     if args.file:
         jobs += [(l.strip(), OUT_DIR) for l in Path(args.file).read_text(encoding="utf-8").splitlines() if l.strip()]
 
+    left = DAILY_LIMIT - used_today()
+    if left <= 0 and not (args.login and not jobs and not args.user):
+        sys.exit(f"Дневният лимит от {DAILY_LIMIT} поста е изчерпан - пробвай утре "
+                 f"(или увеличи DAILY_LIMIT в fb_post.py на свой риск).")
+
     # Без аргументи (напр. от start.bat) - питаме кой потребител и колко поста.
     interactive = not jobs and not args.user and not args.login
     if interactive:
-        args.user, args.limit = ask_user()
+        args.user, args.limit = ask_user(left)
         args.headless = True
         if not args.user:
             return
@@ -388,21 +439,34 @@ def main():
             ctx = new_context(browser)
 
         for user in args.user:
+            want = min(args.limit, left - len(jobs))
+            if want <= 0:
+                print(f"\nПропускам {user}: дневният лимит ще бъде изчерпан.")
+                continue
+            if want < args.limit:
+                print(f"\nЗаради дневния лимит ще сваля само {want} поста на {user}.")
             print(f"\nТърся постове на {user} ...")
             try:
-                found = find_user_posts(ctx, user, args.limit)
+                found = find_user_posts(ctx, user, want)
             except Exception as e:
                 print(f"  Грешка: {e}")
                 continue
             jobs += [(url, OUT_DIR / user_folder(user)) for url in found]
 
-        for url, out_dir in jobs:
+        for i, (url, out_dir) in enumerate(jobs):
+            if used_today() >= DAILY_LIMIT:
+                print(f"\nДневният лимит от {DAILY_LIMIT} поста е изчерпан - спирам.")
+                break
+            if i:
+                pause(POST_PAUSE)
             print(f"\n→ {url}")
             try:
                 folder, text, saved = scrape(ctx, url, out_dir)
             except Exception as e:
                 print(f"  Грешка: {e}")
                 continue
+            finally:
+                count_post()
             preview = text[:120].replace("\n", " ") + ("…" if len(text) > 120 else "")
             print(f"  Текст: {preview or '(няма)'}")
             print(f"  Снимки: {len(saved)}  →  {folder}")
