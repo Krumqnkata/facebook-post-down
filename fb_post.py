@@ -10,7 +10,12 @@ fb_post.py - сваля текста и снимките от пост във Fa
     python fb_post.py -f links.txt          (по един линк на ред)
     python fb_post.py --headless "линк"     (без да се показва прозорец)
 
+Или по потребител/страница (последните N поста):
+    python fb_post.py -u zuck --limit 20
+    python fb_post.py -u "https://www.facebook.com/profile.php?id=100000000000000"
+
 Резултатът е в папка downloads/<дата>_<id>/ : text.txt, 01.jpg, 02.jpg ..., info.json
+(при -u: downloads/<потребител>/<дата>_<id>/)
 """
 import argparse
 import json
@@ -18,7 +23,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from playwright.sync_api import Error as PWError
 from playwright.sync_api import TimeoutError as PWTimeout
@@ -203,7 +208,91 @@ def download(ctx, url, path_no_ext):
     return path
 
 
-def scrape(ctx, url):
+POST_LINK = re.compile(r"/posts/|/permalink\.php|story_fbid=|/videos/|/reel/")
+
+POST_LINKS_JS = r"""
+(unit) => [...unit.querySelectorAll('a[href]')]
+  .map(a => a.href)
+  .filter(h => !/[?&]comment_id=/.test(h))
+"""
+
+
+def profile_url(user):
+    if user.startswith("http"):
+        return user
+    if user.isdigit():
+        return f"https://www.facebook.com/profile.php?id={user}"
+    return f"https://www.facebook.com/{user.lstrip('@')}"
+
+
+def user_folder(user):
+    if user.startswith("http"):
+        u = urlparse(user)
+        q = parse_qs(u.query)
+        user = q["id"][0] if "id" in q else u.path.strip("/").split("/")[0]
+    return re.sub(r"[^\w.-]", "_", user.lstrip("@")) or "user"
+
+
+def clean_post_url(href):
+    u = urlparse(href)
+    q = parse_qs(u.query)
+    keep = {k: q[k][0] for k in ("story_fbid", "id", "v") if k in q}
+    return u._replace(query=urlencode(keep), fragment="").geturl()
+
+
+def unit_post_link(unit):
+    """Връща линка към поста от един елемент на стената."""
+    for attempt in range(2):
+        for href in unit.evaluate(POST_LINKS_JS):
+            if POST_LINK.search(href):
+                return clean_post_url(href)
+        if attempt == 0:
+            # Когато си влязъл, FB слага истинския линк на датата чак при посочване с мишката.
+            stubs = unit.locator('a[href="#"], a[role="link"]:not([href])')
+            for i in range(min(stubs.count(), 6)):
+                try:
+                    stubs.nth(i).hover(timeout=2000)
+                except PWError:
+                    pass
+            time.sleep(0.5)
+    return None
+
+
+def find_user_posts(ctx, user, limit):
+    """Отваря профила/страницата, скролира и събира линковете на последните `limit` поста."""
+    page = ctx.new_page()
+    page.goto(profile_url(user), wait_until="domcontentloaded")
+    if "/login" in page.url or "checkpoint" in page.url:
+        page.close()
+        raise RuntimeError("Facebook поиска вход. Пусни пак: python fb_post.py --login")
+    time.sleep(3)
+
+    urls, done, idle = [], set(), 0
+    while len(urls) < limit and idle < 6:
+        before = len(urls)
+        for pos in page.evaluate("() => [...document.querySelectorAll('[aria-posinset]')].map(e => e.getAttribute('aria-posinset'))"):
+            if pos in done or len(urls) >= limit:
+                continue
+            unit = page.locator(f'[aria-posinset="{pos}"]').first
+            try:
+                unit.scroll_into_view_if_needed(timeout=3000)
+                href = unit_post_link(unit)
+            except PWError:
+                continue
+            if href is None:
+                continue  # още не е заредено - пак ще го видим след скрола
+            done.add(pos)
+            if href not in urls:
+                urls.append(href)
+                print(f"  намерен пост {len(urls)}: {href}")
+        idle = idle + 1 if len(urls) == before else 0
+        page.mouse.wheel(0, 2500)
+        time.sleep(1.5)
+    page.close()
+    return urls
+
+
+def scrape(ctx, url, out_dir=OUT_DIR):
     page = ctx.new_page()
     page.goto(url, wait_until="domcontentloaded")
     if "/login" in page.url or "checkpoint" in page.url:
@@ -233,7 +322,7 @@ def scrape(ctx, url):
         images = collect_images(page, data["links"], data["extra"])
     page.close()
 
-    folder = OUT_DIR / f"{time.strftime('%Y-%m-%d_%H%M%S')}_{post_id(final_url)[:40]}"
+    folder = out_dir / f"{time.strftime('%Y-%m-%d_%H%M%S')}_{post_id(final_url)[:40]}"
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "text.txt").write_text(data["text"], encoding="utf-8")
 
@@ -257,20 +346,23 @@ def main():
     ap = argparse.ArgumentParser(description="Сваля текста и снимките от пост във Facebook.")
     ap.add_argument("urls", nargs="*", help="линк(ове) към пост")
     ap.add_argument("-f", "--file", help="текстов файл с линкове, по един на ред")
+    ap.add_argument("-u", "--user", action="append", default=[],
+                    help="потребител/страница (име, id или линк към профила); може няколко пъти")
+    ap.add_argument("--limit", type=int, default=10, help="колко от последните поста да се свалят при -u (10)")
     ap.add_argument("--login", action="store_true", help="отвори браузър, за да влезеш в акаунта си")
     ap.add_argument("--headless", action="store_true", help="не показвай прозореца на браузъра")
     args = ap.parse_args()
 
-    urls = list(args.urls)
+    jobs = [(url, OUT_DIR) for url in args.urls]
     if args.file:
-        urls += [l.strip() for l in Path(args.file).read_text(encoding="utf-8").splitlines() if l.strip()]
+        jobs += [(l.strip(), OUT_DIR) for l in Path(args.file).read_text(encoding="utf-8").splitlines() if l.strip()]
 
     with sync_playwright() as p:
         if args.login:
             login(p)
-            if not urls:
+            if not jobs and not args.user:
                 return
-        if not urls:
+        if not jobs and not args.user:
             ap.print_help()
             return
 
@@ -279,10 +371,20 @@ def main():
         if not logged_in(ctx):
             browser.close()
             sys.exit("Не си влязъл във Facebook. Пусни първо: python fb_post.py --login")
-        for url in urls:
+
+        for user in args.user:
+            print(f"\nТърся постове на {user} ...")
+            try:
+                found = find_user_posts(ctx, user, args.limit)
+            except Exception as e:
+                print(f"  Грешка: {e}")
+                continue
+            jobs += [(url, OUT_DIR / user_folder(user)) for url in found]
+
+        for url, out_dir in jobs:
             print(f"\n→ {url}")
             try:
-                folder, text, saved = scrape(ctx, url)
+                folder, text, saved = scrape(ctx, url, out_dir)
             except Exception as e:
                 print(f"  Грешка: {e}")
                 continue

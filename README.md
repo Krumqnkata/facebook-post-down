@@ -31,6 +31,19 @@ python fb_post.py -f links.txt          # по един линк на ред
 python fb_post.py --headless "линк"     # без прозорец на браузъра
 ```
 
+### По потребител или страница
+
+Вместо линкове може да дадеш потребителско име, id или линк към профила. Скриптът отваря профила, скролира стената и сваля последните `--limit` поста (по подразбиране 10):
+
+```bash
+python fb_post.py -u zuck --limit 20
+python fb_post.py -u 100000000000000                 # числово id
+python fb_post.py -u "https://www.facebook.com/nasa"
+python fb_post.py -u nasa -u spacex --limit 5        # няколко наведнъж
+```
+
+Постовете отиват в `downloads/<потребител>/`.
+
 ## Резултат
 
 За всеки пост се прави папка `downloads/<дата>_<id>/` с:
